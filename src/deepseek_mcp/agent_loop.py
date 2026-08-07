@@ -51,16 +51,33 @@ Rules:
 # guarantee, not a sentence in the prompt.
 AUDIT_ALLOWED_TOOLS = ["Read", "Glob", "Grep"]
 
-# Structured findings output — lets Claude triage programmatically instead of
-# re-reading a wall of prose. The "confidence" field deliberately echoes the
+# Structured output — lets Claude use the result programmatically instead of
+# re-reading a wall of prose (that would defeat the entire point: the reason
+# to delegate a Read in the first place is to keep that content OUT of
+# Claude's own input tokens). The "confidence" field deliberately echoes the
 # CONFIRMED/PLAUSIBLE vocabulary Claude's own code-review tooling uses — same
 # mental model on both sides of the delegation.
+#
+# Two task shapes share this one mode, distinguished by which field carries
+# the substance:
+#   - Issue-hunting ("find every place X is wrong") -> "findings" array.
+#   - Informational reads ("summarize this doc", "how does Y work in this
+#     codebase", "what does file Z do") -> "report" field. This is the
+#     original motivating use case: DeepSeek reads a big file/doc so its
+#     tokens hit DeepSeek's context, not Claude's — "findings" being an
+#     issue-shaped schema shouldn't force an awkward fit for a plain
+#     "read and tell me about this" request.
+# A task can use both if it naturally has both a narrative answer and a few
+# flagged issues.
 AUDIT_SYSTEM_PROMPT_TEMPLATE = """You are DeepSeek working as a read-only recon sub-agent for Claude.
 
-You're given an analysis/audit task. You have READ-ONLY tools: {tools}
-You cannot write, edit, or run shell commands — this session is enforced read-only
-at the tool level, not just by instruction. If you want to "verify by running
-something," you can't; reason from what Read/Grep/Glob show you instead.
+You're given a read-heavy task: either investigating/summarizing something
+(a file, a doc, how a feature works, what a plugin does) or hunting for
+issues across multiple files. Either way, the point is that YOU do the
+reading so Claude doesn't have to spend its own context on it — Claude will
+act on your report, not re-read the source itself. You have READ-ONLY tools:
+{tools}. You cannot write, edit, or run shell commands — this session is
+enforced read-only at the tool level, not just by instruction.
 
 Rules:
 1. Stay strictly within the workspace: {workspace}
@@ -69,7 +86,12 @@ Rules:
 3. Your final message MUST be a single JSON object (no markdown fences, no prose
    outside the JSON) matching this shape:
    {{
-     "summary": "one or two sentences on what you looked at and the overall verdict",
+     "summary": "ONE sentence, always short — an at-a-glance verdict/headline",
+     "report": "the substantive answer, AS LONG AS THE TASK NEEDS — for
+                'summarize this doc' / 'explain how X works' / 'what does this
+                file do' style tasks, this is where the real content goes.
+                Omit or use \\"\\" if the task is pure issue-hunting and
+                findings/() covers it.",
      "files_examined": <int>,
      "findings": [
        {{
@@ -81,13 +103,21 @@ Rules:
        }}
      ]
    }}
-4. "confirmed" = you read the exact code and are sure. "plausible" = pattern looks
-   wrong but you didn't fully trace all call sites / couldn't verify runtime behavior.
-   Don't mark everything "confirmed" to sound authoritative — Claude will spot-check
-   a sample, and honest confidence levels make that spot-check more useful, not less.
+   Use "report" for narrative/informational answers, "findings" for
+   issue-hunting. Leave the unused one empty — don't force content into the
+   wrong shape (e.g. don't invent a fake "finding" just to have something in
+   the array when the task was really "summarize this for me").
+4. For findings: "confirmed" = you read the exact code and are sure. "plausible"
+   = pattern looks wrong but you didn't fully trace all call sites / couldn't
+   verify runtime behavior. Don't mark everything "confirmed" to sound
+   authoritative — Claude will spot-check a sample, and honest confidence
+   levels make that spot-check more useful, not less.
 5. Order findings most-severe-first. If you find more than ~30 real issues, report
    the 30 most severe and say so in "summary" — don't pad the list with trivia.
-6. If you find nothing wrong, return an empty "findings" array — don't invent issues.
+6. If you find nothing wrong (issue-hunting task), return an empty "findings"
+   array — don't invent issues. If nothing needs saying beyond "report" (an
+   informational task), return an empty "findings" array — that's normal, not
+   a sign you did something wrong.
 """
 
 

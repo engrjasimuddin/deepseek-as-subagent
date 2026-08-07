@@ -119,17 +119,23 @@ def delegate_to_deepseek(task: str, context: str = "", mode: str = "execute") ->
 
     mode="audit" — DeepSeek is READ-ONLY (Read/Glob/Grep only — no Write, Edit,
     NotebookEdit, or Bash; enforced at the tool-dispatch level, not just by
-    instruction). It investigates and returns structured JSON findings
-    (file/line/summary/severity/confidence) instead of making changes. Use this
-    for read-heavy analysis across many files where finding the issue is
-    expensive but fixing it is cheap — YOU (Claude) then decide what to do
-    with each finding and make the actual edits yourself. Findings are capped
-    at 30, most-severe-first.
+    instruction). Use this whenever you'd otherwise spend YOUR OWN context
+    Reading a large file/doc or several files just to extract information —
+    hand the reading to DeepSeek instead, its tokens absorb the file content,
+    not yours. Covers two related task shapes:
 
-      Good fits: "scan these 15 plugins for X pattern", "find every place Y is
-      called without Z", multi-file security/consistency sweeps.
-      Bad fits for audit mode: single-file bug hunts (just Read it yourself),
-      tasks where you already know which 1-2 files to check.
+      - Informational reads: "summarize this doc", "explain how X works in
+        this codebase", "what does this file do", "read these 3 files and
+        tell me Y" — DeepSeek reads and returns a "report" (as long as the
+        task needs — could be a full explanation, not just a blurb).
+      - Issue-hunting: "scan these 15 plugins for X pattern", "find every
+        place Y is called without Z" — DeepSeek returns structured "findings"
+        (file/line/summary/severity/confidence), capped at 30, most-severe-
+        first, for YOU to triage and fix yourself.
+
+      Bad fits for audit mode: a single small file you'd read in one call
+      anyway (delegation overhead isn't worth it — just Read it), tasks
+      needing your own architectural judgment mid-read.
 
     Neither mode is a fit for: architectural design / cross-file judgment calls,
     deep single-bug root-cause reasoning, or tasks requiring project-specific
@@ -138,8 +144,8 @@ def delegate_to_deepseek(task: str, context: str = "", mode: str = "execute") ->
 
     Args:
         task: Clear description of what DeepSeek should accomplish, including
-              success criteria (execute mode) or what to look for (audit mode),
-              and file paths/scope involved.
+              success criteria (execute mode) or what to read/look for (audit
+              mode), and file paths/scope involved.
         context: Optional additional context — project conventions, related
                  files DeepSeek should consider, output format requirements.
                  Include this when project-specific knowledge matters.
@@ -151,11 +157,16 @@ def delegate_to_deepseek(task: str, context: str = "", mode: str = "execute") ->
         turns used, tokens consumed, and any issues. Always verify by reading a
         sample of the affected files before declaring success to the user.
 
-        audit mode: a JSON string with "summary", "files_examined", and a
-        "findings" array. Each finding has a "confidence" of "confirmed" or
-        "plausible" — spot-check at least the "plausible" ones yourself before
-        acting on them (DeepSeek's self-reported confidence is a hint, not a
-        guarantee).
+        audit mode: a JSON string with "summary" (always short), "report"
+        (the substantive answer for informational tasks, empty for pure
+        issue-hunts), "files_examined", and a "findings" array (empty for
+        pure informational tasks). Each finding has a "confidence" of
+        "confirmed" or "plausible" — spot-check at least the "plausible" ones
+        yourself before acting on them (DeepSeek's self-reported confidence is
+        a hint, not a guarantee). For informational reads, treat "report" the
+        same way you'd treat your own Read of the file — DeepSeek can
+        misread/summarize badly, so for anything decision-critical, spot-check
+        with a quick Read yourself.
     """
     env_mode = os.getenv("DEEPSEEK_MODE", "auto")
     if env_mode == "off":

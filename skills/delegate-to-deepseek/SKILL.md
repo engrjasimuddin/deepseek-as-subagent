@@ -102,41 +102,56 @@ Delegate to DS (DS reads 100k)      DS takes over all Read + processing
 
 ---
 
-## 🔎 `mode="audit"` — Read-Only Recon for Multi-File Analysis
+## 🔎 `mode="audit"` — Read-Only Recon: Keep Big Reads Out of Main Agent's Context
 
-This is a **different shape of delegation** from everything above. `mode="execute"` (the default) hands DeepSeek a task it completes end-to-end, including any edits — Main Agent gets a summary back, not the raw material. `mode="audit"` is the opposite: DeepSeek is **read-only** (Read/Glob/Grep only — no Write/Edit/NotebookEdit/Bash, enforced at the tool-dispatch level, not just a prompt instruction) and returns **structured JSON findings** (`file`, `line`, `summary`, `severity`, `confidence`) instead of a change. Main Agent stays the decision-maker and does the actual editing.
+This is a **different shape of delegation** from everything above. `mode="execute"` (the default) hands DeepSeek a task it completes end-to-end, including any edits — Main Agent gets a summary back, not the raw material. `mode="audit"` is the opposite: DeepSeek is **read-only** (Read/Glob/Grep only — no Write/Edit/NotebookEdit/Bash, enforced at the tool-dispatch level, not just a prompt instruction) and returns a **compact structured report** instead of making a change. Main Agent stays the decision-maker; DeepSeek just did the expensive reading so Main Agent's own context didn't have to absorb it.
 
-**Why this exists**: some tasks are expensive to *investigate* but cheap to *fix* — a security/consistency sweep across 10-15 files where each individual fix is a few lines, but finding all the occurrences means reading everything. In `mode="execute"`, DeepSeek would either need to also make the edits itself (fine for mechanical batch fixes, risky for anything needing judgment) or Main Agent would have to Read everything itself first anyway to know what to delegate — defeating the point. `mode="audit"` splits it cleanly: DeepSeek does the expensive reading, Main Agent does the cheap judgment-requiring edits.
+**Primary use case — routine information-gathering, not just bug-hunting.** Any time Main Agent would otherwise `Read` a large file/doc, or several files, purely to extract information (not to edit it) — that Read's full content lands in Main Agent's own context and stays there, burning tokens for the rest of the conversation. Delegate that Read to DeepSeek in `mode="audit"` instead: DeepSeek's tokens absorb the file content, Main Agent only receives the distilled report. **This should be the default instinct for large docs/plans/architecture files, not a special-case tool** — e.g. "what does this 500-line plan doc say", "summarize this architecture doc", "explain how this feature works across these files", "what does this plugin do".
+
+**Secondary use case — issue-hunting.** Same mechanism, different output shape: a security/consistency sweep across 10-15 files where each individual fix is a few lines, but finding all the occurrences means reading everything. Returns structured findings (`file`, `line`, `summary`, `severity`, `confidence`) instead of a narrative report.
+
+The response JSON has both a `"report"` field (narrative — use for informational reads) and a `"findings"` array (structured — use for issue-hunting); a given task typically populates one and leaves the other empty. Don't force an issue-hunt-shaped answer out of a "summarize this for me" task, or vice versa.
 
 ### When to use `mode="audit"` vs `mode="execute"` vs do-it-yourself
 
 | Task shape | Mode |
 |---|---|
-| "Scan these 15 plugins for pattern X" / "find every place Y is called without Z" | `mode="audit"` |
+| "What does this doc/file/plugin say or do" / "summarize X" / "explain how Y works" | `mode="audit"` (`report` field) |
+| "Scan these 15 plugins for pattern X" / "find every place Y is called without Z" | `mode="audit"` (`findings` array) |
 | "Fix pattern X in these 15 files" (fix itself is mechanical, no judgment needed) | `mode="execute"` |
 | "Why is this one specific bug happening" (already know the file) | Do it yourself |
-| "Is this plugin's auth flow secure" (1-2 files you can just Read) | Do it yourself — audit-mode overhead not worth it for a handful of files |
+| A single small file you'd read in one call anyway | Do it yourself — audit-mode overhead (DS reasoning startup cost) isn't worth it for one small Read |
 
 ### Using it
 
 ```
 mcp__deepseek__delegate_to_deepseek(
-  task="<what to look for + which files/directories + what counts as a finding>",
-  context="<project conventions the audit should check against, known false-positive patterns to skip>",
+  task="<what to read/investigate, OR what to look for + which files/directories>",
+  context="<project conventions, known false-positive patterns to skip, output format needs>",
   mode="audit"
 )
 ```
 
-Findings are capped at 30 (most-severe-first, both by prompt instruction and by a server-side hard truncation — don't assume "no findings" means "clean" if `findings_truncated: true` is set, it means there were more than 30). Each finding has a `confidence` of `"confirmed"` or `"plausible"` — DeepSeek's own self-assessment, not a guarantee.
+Findings are capped at 30 (most-severe-first, both by prompt instruction and by a server-side hard truncation — don't assume "no findings" means "clean" if `findings_truncated: true` is set, it means there were more than 30). Each finding has a `confidence` of `"confirmed"` or `"plausible"` — DeepSeek's own self-assessment, not a guarantee. The `report` field has no such cap — DeepSeek is told to make it as long as the task needs.
 
 ### After an audit — this replaces the normal "Must Do After Delegation" verification
 
 Since audit mode never touches files, the usual "spot-check the written output" step doesn't apply the same way. Instead:
 
+**For issue-hunting (`findings` array) results:**
+
 1. **Triage, don't blindly act.** Treat `"confidence": "confirmed"` findings as high-trust but not infallible; treat `"plausible"` findings as needing your own quick look before you act on them.
 2. **Spot-check at least 1-2 "confirmed" findings** by reading the actual file yourself — DeepSeek can be wrong about what "confirmed" means even when instructed not to overclaim.
 3. **You make the actual fix.** Audit mode's whole point is that Main Agent does the edit (with full project-context judgment), not DeepSeek. Don't re-delegate the fix in `mode="execute"` unless the fix itself is genuinely mechanical.
-4. **If the response has a `NOTE: ... was not valid JSON` suffix**, DeepSeek didn't follow the structured-output format — treat the whole thing as unverified prose and read the raw text yourself before trusting any of it.
+
+**For informational reads (`report` field) results:**
+
+4. **Treat `report` like your own Read, with the same trust level** — DeepSeek can misread or mis-summarize. For anything decision-critical (a number you'll act on, a claim you'll repeat to the user, a detail that affects what you do next), spot-check with a quick targeted Read of the source yourself rather than fully trusting the summary.
+5. **Don't assume perfect fidelity on facts/counts.** DeepSeek can invent small specifics that sound plausible (a real observed failure mode: reporting a file count or detail that was never actually stated in the source). If a specific number/claim matters, verify it.
+
+**Both cases:**
+
+6. **If the response has a `NOTE: ... was not valid JSON` suffix**, DeepSeek didn't follow the structured-output format — treat the whole thing as unverified prose and read the raw text yourself before trusting any of it.
 
 ---
 
