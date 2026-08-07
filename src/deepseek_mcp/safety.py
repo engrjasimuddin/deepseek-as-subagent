@@ -1,19 +1,21 @@
-"""沙箱：路径限制 + 命令黑名单。
+"""Sandbox: path restrictions + command blacklist.
 
-设计目标：DeepSeek 是"听话的助手但不一定可靠"——它可能误读路径、误跑命令。
-不上 docker（启动慢、依赖重），用进程内的轻量检查防住 95% 的误操作。
+Design goal: DeepSeek is an "obedient assistant but not guaranteed reliable" —
+it may misread paths or run wrong commands. No docker (slow startup, heavy dependencies),
+use lightweight in-process checks to catch 95% of accidents.
 
-注意：黑名单 ≠ 安全边界。真正的对抗性攻击应该用 docker / bubblewrap / sandbox-exec
-之类的真沙箱包起来。这里的检查只是"防 DeepSeek 走神"的护栏。
+Note: Blacklist is not a security boundary. Real adversarial attacks should use
+docker / bubblewrap / sandbox-exec or similar true sandboxes. These checks are only
+guardrails to prevent DeepSeek from "going off-script."
 """
 from __future__ import annotations
 
 import shlex
 from pathlib import Path
 
-# 危险命令检测的两种粒度：
-#   1) DANGEROUS_TOKENS：第一个 token（程序名）整体匹配，难以用 \ 编码绕过
-#   2) DANGEROUS_PHRASES：完整短语子串匹配（rm -rf / 这种"不可能合法"的组合）
+# Dangerous command detection at two granularities:
+#   1) DANGEROUS_TOKENS: first token (program name) exact match, hard to bypass with \ encoding
+#   2) DANGEROUS_PHRASES: full phrase substring match (combinations like rm -rf / that are "never legitimate")
 DANGEROUS_TOKENS = {
     "sudo",
     "su",
@@ -24,12 +26,12 @@ DANGEROUS_TOKENS = {
     "socat",
 }
 
-# 配套程序名集合（出现在 token 流任意位置即拒绝）
+# Companion program names (rejected if they appear anywhere in the token stream)
 DANGEROUS_ANYWHERE_TOKENS = {
     "sudo", "su",
 }
 
-# 完整短语匹配（保留旧风格，专门抓"形态独特"的危险组合）
+# Full phrase match (preserves old style, specifically catches "morphologically unique" dangerous combos)
 DANGEROUS_PHRASES = [
     "rm -rf /",
     "rm -rf ~",
@@ -46,7 +48,7 @@ DANGEROUS_PHRASES = [
     "/dev/udp/",
 ]
 
-# Python / shell / 解释器 -c 后内联代码：很容易藏恶意命令，统一拒绝
+# Python / shell / interpreter -c inline code: easily hides malicious commands, reject uniformly
 DANGEROUS_INLINE_INTERPRETERS = {
     ("python", "-c"), ("python3", "-c"),
     ("perl", "-e"), ("ruby", "-e"),
@@ -55,7 +57,7 @@ DANGEROUS_INLINE_INTERPRETERS = {
     ("sh", "-c"), ("bash", "-c"), ("zsh", "-c"), ("ksh", "-c"), ("dash", "-c"),
 }
 
-# 包管理"装东西"动作：易被滥用装恶意包
+# Package manager "install" actions: easily abused to install malicious packages
 PACKAGE_INSTALL_PREFIXES = [
     ("pip", "install"), ("pip3", "install"),
     ("pipx", "install"),
@@ -71,7 +73,7 @@ PACKAGE_INSTALL_PREFIXES = [
     ("dnf", "install"), ("yum", "install"),
 ]
 
-# 发布 / 推送动作：写到外部世界的"出口"
+# Publish / push actions: "exit points" that write to the outside world
 PUBLISH_PREFIXES = [
     ("git", "push"),
     ("npm", "publish"),
@@ -82,14 +84,14 @@ PUBLISH_PREFIXES = [
 
 
 class SandboxViolation(Exception):
-    """工具调用违反沙箱规则。返回给 DeepSeek 让它知道为什么失败。"""
+    """Tool call violated sandbox rules. Returned to DeepSeek so it knows why it failed."""
 
 
 def resolve_safe_path(rel_or_abs: str, workspace: Path) -> Path:
-    """把 DeepSeek 传来的路径解析到绝对路径，并校验在 workspace 内。
+    """Resolve a path from DeepSeek to an absolute path and verify it's inside the workspace.
 
-    返回值：解析后的绝对路径。
-    抛出：SandboxViolation 如果路径逃出 workspace。
+    Returns: resolved absolute path.
+    Raises: SandboxViolation if the path escapes the workspace.
     """
     if not rel_or_abs:
         raise SandboxViolation("empty path is not allowed")
@@ -114,7 +116,7 @@ def resolve_safe_path(rel_or_abs: str, workspace: Path) -> Path:
 
 
 def _tokenize(command: str) -> list[str]:
-    """安全分词。命令引号不闭合时 shlex 会抛错；回退到 split。"""
+    """Safe tokenization. Falls back to split when shlex errors on unclosed quotes."""
     try:
         return shlex.split(command, comments=False, posix=True)
     except ValueError:
@@ -122,30 +124,30 @@ def _tokenize(command: str) -> list[str]:
 
 
 def check_command(command: str) -> None:
-    """检查 Bash 命令是否在黑名单里。抛 SandboxViolation 即拒绝。
+    """Check if a Bash command is on the blacklist. Raises SandboxViolation to reject.
 
-    多层检查（任一命中即拒）：
-      1) DANGEROUS_PHRASES：粗粒度子串
-      2) DANGEROUS_TOKENS：分词后程序名（第一个 token 或管道后第一个 token）
-      3) DANGEROUS_ANYWHERE_TOKENS：sudo / su 出现在任何位置
-      4) DANGEROUS_INLINE_INTERPRETERS：python -c / perl -e 等
-      5) PACKAGE_INSTALL_PREFIXES：装包动作
-      6) PUBLISH_PREFIXES：发布动作（git push / npm publish 等）
+    Multi-layer checks (any hit rejects):
+      1) DANGEROUS_PHRASES: coarse-grained substring
+      2) DANGEROUS_TOKENS: tokenized program name (first token or first token after pipe)
+      3) DANGEROUS_ANYWHERE_TOKENS: sudo / su appearing anywhere
+      4) DANGEROUS_INLINE_INTERPRETERS: python -c / perl -e etc.
+      5) PACKAGE_INSTALL_PREFIXES: package install actions
+      6) PUBLISH_PREFIXES: publish actions (git push / npm publish etc.)
     """
     if not command or not command.strip():
         raise SandboxViolation("empty command")
 
     lower = command.lower()
 
-    # 1) 短语匹配（不分词，专抓特殊组合）
+    # 1) Phrase match (no tokenization, specifically catches special combinations)
     for phrase in DANGEROUS_PHRASES:
         if phrase.lower() in lower:
             raise SandboxViolation(
                 f"Command blocked by sandbox: contains dangerous phrase '{phrase}'."
             )
 
-    # 2-6) 分词后逐段检查（按 ; && || | 分子句）
-    # 简单切分；不追求 100% bash 解析，目的是不让 'a; rm -rf /' 漏掉
+    # 2-6) Tokenize then check per-clause (split by ; && || |)
+    # Simple split; doesn't aim for 100% bash parsing, just prevents 'a; rm -rf /' from slipping through
     clauses = _split_clauses(command)
     for clause in clauses:
         tokens = _tokenize(clause)
@@ -154,21 +156,21 @@ def check_command(command: str) -> None:
 
         first = _strip_cmd_prefix(tokens[0])
 
-        # 任意位置出现 sudo / su
+        # sudo / su appearing anywhere
         for tok in tokens:
             if _strip_cmd_prefix(tok) in DANGEROUS_ANYWHERE_TOKENS:
                 raise SandboxViolation(
                     f"Command blocked by sandbox: '{tok}' not allowed."
                 )
 
-        # 程序名黑名单
+        # Program name blacklist
         if first in DANGEROUS_TOKENS:
             raise SandboxViolation(
                 f"Command blocked by sandbox: program '{first}' not allowed "
                 f"(network / privilege escalation tools are disabled)."
             )
 
-        # 内联解释器
+        # Inline interpreter
         if len(tokens) >= 2:
             sig = (first, tokens[1])
             if sig in DANGEROUS_INLINE_INTERPRETERS:
@@ -177,7 +179,7 @@ def check_command(command: str) -> None:
                     f"is not allowed (write a file then run it instead)."
                 )
 
-        # 装包 / 发布
+        # Package install / publish
         if len(tokens) >= 2:
             sig = (first, tokens[1])
             if sig in PACKAGE_INSTALL_PREFIXES:
@@ -193,7 +195,7 @@ def check_command(command: str) -> None:
 
 
 def _split_clauses(command: str) -> list[str]:
-    """按 ; && || | 切分子句（粗粒度，不考虑引号内的分隔符 — 用足够好就行）。"""
+    """Split into clauses by ; && || | (coarse-grained, ignores separators inside quotes — good enough)."""
     out: list[str] = []
     buf: list[str] = []
     i = 0
@@ -202,7 +204,7 @@ def _split_clauses(command: str) -> list[str]:
     in_double = False
     while i < n:
         c = command[i]
-        # 简单引号跟踪，避免 ';' 在引号里被当分隔符
+        # Simple quote tracking, prevents ';' inside quotes from being treated as separator
         if c == "'" and not in_double:
             in_single = not in_single
             buf.append(c)
@@ -229,7 +231,7 @@ def _split_clauses(command: str) -> list[str]:
 
 
 def _strip_cmd_prefix(tok: str) -> str:
-    """剥掉 'command'/'\\'/'/path/to/' 等程序名前缀，归一化判断。"""
+    """Strip 'command'/'\\'/'/path/to/' etc. program name prefixes for normalized judgment."""
     # 'command curl' / '\curl' / '/usr/bin/curl' → 'curl'
     if tok.startswith("\\"):
         tok = tok[1:]

@@ -1,6 +1,6 @@
-"""DeepSeek agent loop。
+"""DeepSeek agent loop.
 
-接收一个任务描述 → 让 DeepSeek 自己跑 Read/Edit/Bash 等工具循环 → 返回 final message。
+Receives a task description → lets DeepSeek run its own Read/Edit/Bash tool cycle → returns final message.
 """
 from __future__ import annotations
 
@@ -16,11 +16,11 @@ from .tools import build_tool_schemas, execute_tool
 
 logger = logging.getLogger(__name__)
 
-# 单次 API 调用最多重试次数（不含首次）。只对网络 / 限流类瞬态错误生效。
+# Max retry attempts per API call (excluding first attempt). Only for network/rate-limit transient errors.
 API_RETRY_ATTEMPTS = 2
 API_RETRY_BACKOFF_SECONDS = 2.0
 
-# 工具参数日志：含敏感内容的字段（避免写到 server.log）
+# Tool argument logging: fields containing sensitive content (avoid writing to server.log)
 SENSITIVE_TOOL_ARG_KEYS = {"content", "new_string"}
 
 
@@ -43,16 +43,65 @@ Rules:
    skip the file, or report and stop. Don't blindly loop on the same error.
 """
 
+# Audit mode: DeepSeek can only read (Read/Glob/Grep) — no Bash either. Bash's
+# blacklist only blocks obviously dangerous commands (see the note at the top
+# of safety.py: "blacklist is not a security boundary") — things like
+# `rm foo.php` / `sed -i` / `echo x > file` all sail right through it. So audit
+# mode simply doesn't offer Bash at all; the tool set itself is the read-only
+# guarantee, not a sentence in the prompt.
+AUDIT_ALLOWED_TOOLS = ["Read", "Glob", "Grep"]
+
+# Structured findings output — lets Claude triage programmatically instead of
+# re-reading a wall of prose. The "confidence" field deliberately echoes the
+# CONFIRMED/PLAUSIBLE vocabulary Claude's own code-review tooling uses — same
+# mental model on both sides of the delegation.
+AUDIT_SYSTEM_PROMPT_TEMPLATE = """You are DeepSeek working as a read-only recon sub-agent for Claude.
+
+You're given an analysis/audit task. You have READ-ONLY tools: {tools}
+You cannot write, edit, or run shell commands — this session is enforced read-only
+at the tool level, not just by instruction. If you want to "verify by running
+something," you can't; reason from what Read/Grep/Glob show you instead.
+
+Rules:
+1. Stay strictly within the workspace: {workspace}
+2. Explore broadly first (Glob/Grep to find candidate files), then Read the files
+   that matter. Don't Read every file in the workspace if the task doesn't need it.
+3. Your final message MUST be a single JSON object (no markdown fences, no prose
+   outside the JSON) matching this shape:
+   {{
+     "summary": "one or two sentences on what you looked at and the overall verdict",
+     "files_examined": <int>,
+     "findings": [
+       {{
+         "file": "path/relative/to/workspace.php",
+         "line": <int or null>,
+         "summary": "one-sentence statement of the issue",
+         "severity": "critical" | "high" | "medium" | "low",
+         "confidence": "confirmed" | "plausible"
+       }}
+     ]
+   }}
+4. "confirmed" = you read the exact code and are sure. "plausible" = pattern looks
+   wrong but you didn't fully trace all call sites / couldn't verify runtime behavior.
+   Don't mark everything "confirmed" to sound authoritative — Claude will spot-check
+   a sample, and honest confidence levels make that spot-check more useful, not less.
+5. Order findings most-severe-first. If you find more than ~30 real issues, report
+   the 30 most severe and say so in "summary" — don't pad the list with trivia.
+6. If you find nothing wrong, return an empty "findings" array — don't invent issues.
+"""
+
 
 class AgentLoopError(Exception):
     """Agent loop failed (max turns exceeded, API error, etc)."""
 
 
-def run_agent(task: str, config: Config) -> dict:
-    """跑完整 agent loop。
+def run_agent(task: str, config: Config, system_prompt_template: str | None = None) -> dict:
+    """Run the full agent loop.
 
-    返回 dict:
-      - final_message: str (DeepSeek 给的最终答复)
+    system_prompt_template: override the default prompt (pass AUDIT_SYSTEM_PROMPT_TEMPLATE for audit mode).
+
+    Returns dict:
+      - final_message: str (DeepSeek's final response)
       - turns_used: int
       - tokens: {prompt, completion, total}
       - tool_calls: int
@@ -61,7 +110,8 @@ def run_agent(task: str, config: Config) -> dict:
     client = OpenAI(api_key=config.api_key, base_url=config.base_url)
     tools = build_tool_schemas(config.allowed_tools)
 
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+    template = system_prompt_template or SYSTEM_PROMPT_TEMPLATE
+    system_prompt = template.format(
         tools=", ".join(config.allowed_tools),
         workspace=config.workspace,
     )
@@ -86,13 +136,13 @@ def run_agent(task: str, config: Config) -> dict:
 
         msg = response.choices[0].message
 
-        # 用 raw dict 保留所有字段，包括 DeepSeek v4-pro thinking mode 的 reasoning_content
-        # —— 它要求下一轮必须把 reasoning_content 也回传，否则 400 报错
+        # Use raw dict to preserve all fields, including DeepSeek v4-pro thinking mode's reasoning_content
+        # — it requires reasoning_content to be sent back in the next turn, otherwise 400 error
         raw = response.model_dump(exclude_none=True)
         msg_dict = raw["choices"][0]["message"]
         messages.append(msg_dict)
 
-        # 没有 tool_calls 说明 DeepSeek 决定结束
+        # No tool_calls means DeepSeek decided to stop
         if not msg.tool_calls:
             return {
                 "final_message": msg.content or "(empty response)",
@@ -106,22 +156,37 @@ def run_agent(task: str, config: Config) -> dict:
                 "duration_seconds": round(time.time() - started, 2),
             }
 
-        # 依次执行 tool calls
+        # Execute tool calls sequentially
         for tc in msg.tool_calls:
             tool_call_count += 1
             tool_name = tc.function.name
-            try:
-                args = json.loads(tc.function.arguments)
-            except json.JSONDecodeError as e:
-                result = f"ERROR: invalid JSON in tool arguments: {e}"
-            else:
-                logger.info(
-                    "Turn %d tool_call: %s(%s)",
-                    turn,
-                    tool_name,
-                    _redact_args_for_log(args),
+
+            # Hard re-check here — don't fully trust "not offered in the schema
+            # means it can't be called." Previously this was the only execution
+            # entry point and never re-verified allowed_tools; it relied solely
+            # on build_tool_schemas() not exposing the schema as a "soft" limit.
+            if tool_name not in config.allowed_tools:
+                logger.warning(
+                    "Turn %d blocked tool_call outside allowed_tools: %s (allowed: %s)",
+                    turn, tool_name, config.allowed_tools,
                 )
-                result = execute_tool(tool_name, args, config.workspace)
+                result = (
+                    f"ERROR: tool '{tool_name}' is not permitted in this session "
+                    f"(allowed: {config.allowed_tools})."
+                )
+            else:
+                try:
+                    args = json.loads(tc.function.arguments)
+                except json.JSONDecodeError as e:
+                    result = f"ERROR: invalid JSON in tool arguments: {e}"
+                else:
+                    logger.info(
+                        "Turn %d tool_call: %s(%s)",
+                        turn,
+                        tool_name,
+                        _redact_args_for_log(args),
+                    )
+                    result = execute_tool(tool_name, args, config.workspace)
 
             messages.append(
                 {
@@ -131,7 +196,7 @@ def run_agent(task: str, config: Config) -> dict:
                 }
             )
 
-    # 跑到 max_turns 没收敛 —— 只展示最后一条 assistant content，不夹带完整 tool_calls blob
+    # Hit max_turns without converging — only show the last assistant content, not the full tool_calls blob
     last_text = ""
     for m in reversed(messages):
         if m.get("role") == "assistant" and m.get("content"):
@@ -144,9 +209,9 @@ def run_agent(task: str, config: Config) -> dict:
 
 
 def _call_with_retry(client, config, messages, tools, turn):
-    """带瞬态错误重试的单次 API 调用。
+    """Single API call with transient error retry.
 
-    只对 network / rate-limit / 5xx 这类瞬态错误重试；4xx 等永久错误直接抛。
+    Only retries on transient errors like network / rate-limit / 5xx; permanent errors like 4xx are raised immediately.
     """
     last_exc = None
     for attempt in range(1 + API_RETRY_ATTEMPTS):
@@ -166,7 +231,7 @@ def _call_with_retry(client, config, messages, tools, turn):
             )
             time.sleep(wait)
         except APIError as e:
-            # 5xx 也重试，4xx 不重试
+            # 5xx also retries, 4xx does not
             status = getattr(e, "status_code", None)
             if status and 500 <= status < 600:
                 last_exc = e
@@ -186,7 +251,7 @@ def _call_with_retry(client, config, messages, tools, turn):
 
 
 def _redact_args_for_log(args: dict) -> dict:
-    """工具参数写日志前脱敏 —— content/new_string 不能进 server.log（可能含 secrets）。"""
+    """Redact tool arguments before logging — content/new_string must not go into server.log (may contain secrets)."""
     redacted = {}
     for k, v in args.items():
         if k in SENSITIVE_TOOL_ARG_KEYS and isinstance(v, str):

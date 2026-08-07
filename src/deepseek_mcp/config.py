@@ -1,8 +1,9 @@
-"""加载 ~/.deepseek-mcp/config.json + env 覆盖。
+"""Load ~/.deepseek-mcp/config.json + env overrides.
 
-优先级：环境变量 > 配置文件 > 默认值（cwd）。
-workspace 默认跟随 MCP server 进程的 cwd —— 即 Claude Code 启动时的目录，
-和 Claude 主进程沙箱一致，不强制用户配置。
+Priority: environment variable > config file > defaults (cwd).
+workspace defaults to following the MCP server process's cwd — i.e. the directory
+where Claude Code was launched, consistent with Claude's main process sandbox;
+no manual config required.
 """
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".deepseek-mcp" / "config.json"
 
-DEFAULT_MODEL = "deepseek-v4-pro"  # 主力模型（推理强）；省钱场景改 deepseek-v4-flash
+DEFAULT_MODEL = "deepseek-v4-pro"  # Primary model (strong reasoning); switch to deepseek-v4-flash for cost savings
 DEFAULT_MAX_TURNS = 50
 DEFAULT_ALLOWED_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "NotebookEdit"]
 
@@ -32,8 +33,8 @@ class Config:
 
     @classmethod
     def load(cls) -> "Config":
-        # DEEPSEEK_MODE=off → 让 server.py 自己判断是否暴露工具
-        # 这里只负责加载真实配置
+        # DEEPSEEK_MODE=off → let server.py decide whether to expose tools
+        # Here we only load the real config
         data: dict = {}
         if CONFIG_PATH.exists():
             try:
@@ -45,7 +46,7 @@ class Config:
             if not isinstance(data, dict):
                 raise RuntimeError(f"Top-level of {CONFIG_PATH} must be a JSON object")
 
-        # API key: env > config，strip 前后空白（粘贴常带）
+        # API key: env > config, strip leading/trailing whitespace (paste often includes it)
         api_key = (os.getenv("DEEPSEEK_API_KEY") or data.get("api_key", "")).strip()
         if not api_key or api_key == "PASTE_YOUR_DEEPSEEK_KEY_HERE":
             raise RuntimeError(
@@ -58,8 +59,8 @@ class Config:
                 "Check that you copied the full key from platform.deepseek.com."
             )
 
-        # workspace 解析：env > config > cwd
-        # 配错了不 hard fail —— 警告 + fallback 到 cwd，确保 MCP 总能工作
+        # workspace resolution: env > config > cwd
+        # Misconfiguration doesn't hard fail — warning + fallback to cwd, ensures MCP always works
         workspace_str = os.getenv("DEEPSEEK_WORKSPACE") or data.get("workspace", "")
         if workspace_str:
             workspace = Path(os.path.expanduser(workspace_str)).resolve()
@@ -70,9 +71,9 @@ class Config:
                 )
                 workspace = Path.cwd()
         else:
-            workspace = Path.cwd()  # 跟随 Claude Code 启动目录
+            workspace = Path.cwd()  # Follow Claude Code launch directory
 
-        # max_turns 必须 >= 1，否则 for-loop 不进，下游会拿到不一致状态
+        # max_turns must be >= 1, otherwise for-loop won't enter and downstream gets inconsistent state
         try:
             max_turns = int(data.get("max_turns", DEFAULT_MAX_TURNS))
         except (TypeError, ValueError):

@@ -1,16 +1,16 @@
-"""6 个本地工具的实现 + OpenAI 风格 function schema 定义。
+"""Implementations for 7 local tools + OpenAI-style function schema definitions.
 
-DeepSeek 调用时：
-1. agent_loop.py 收到 tool_call(name, arguments)
-2. 调度到这里的对应 _execute_xxx 函数
-3. 函数返回字符串结果（成功结果 or 错误说明）
-4. 字符串塞回 messages 给 DeepSeek 继续
+When DeepSeek calls:
+1. agent_loop.py receives tool_call(name, arguments)
+2. Dispatches to the corresponding _execute_xxx function here
+3. Function returns a string result (success or error description)
+4. String is fed back into messages for DeepSeek to continue
 
-设计原则：
-- 失败不抛异常，返回 "ERROR: ..." 字符串让 DeepSeek 自己看到 + 决定下一步
-- 输出截断：单次工具结果 > 50K chars 截断，防止把 DeepSeek context 撑爆
-- 路径必须走 safety.resolve_safe_path，禁止任何裸路径操作
-- 文本读写显式 utf-8，避免 Windows 默认 cp1252 乱码
+Design principles:
+- Failures don't raise exceptions; return "ERROR: ..." strings so DeepSeek can see and decide next steps
+- Output truncation: single tool result > 50K chars gets truncated to avoid blowing up DeepSeek's context
+- All paths must go through safety.resolve_safe_path; raw path operations are forbidden
+- Text read/write explicitly uses utf-8 to avoid Windows default cp1252 encoding issues
 """
 from __future__ import annotations
 
@@ -23,9 +23,9 @@ from pathlib import Path
 
 from .safety import SandboxViolation, check_command, resolve_safe_path
 
-MAX_TOOL_OUTPUT = 50_000  # 单次工具结果最大字符数
-MAX_WRITE_BYTES = 5_000_000  # 单次 Write 最大字节数（5MB，防 DeepSeek 写爆磁盘）
-MAX_BASH_TIMEOUT = 600  # Bash 命令最大 timeout（秒）
+MAX_TOOL_OUTPUT = 50_000  # max chars per single tool result
+MAX_WRITE_BYTES = 5_000_000  # max bytes per single Write (5MB, prevent DeepSeek from filling disk)
+MAX_BASH_TIMEOUT = 600  # max Bash command timeout (seconds)
 DEFAULT_BASH_TIMEOUT = 60
 
 
@@ -39,7 +39,7 @@ def _truncate(text: str) -> str:
 
 
 def _is_binary(path: Path, sniff_bytes: int = 8192) -> bool:
-    """简单二进制嗅探：前 N 字节含 null byte 即视为二进制。"""
+    """Simple binary sniffing: if the first N bytes contain a null byte, treat as binary."""
     try:
         with path.open("rb") as f:
             chunk = f.read(sniff_bytes)
@@ -48,11 +48,11 @@ def _is_binary(path: Path, sniff_bytes: int = 8192) -> bool:
         return False
 
 
-# ===== 工具实现 =====
+# ===== Tool implementations =====
 
 
 def _execute_read(args: dict, workspace: Path) -> str:
-    """读文件。args: {path: str, offset?: int, limit?: int}"""
+    """Read a file. args: {path: str, offset?: int, limit?: int}"""
     path = args.get("path", "")
     if not path:
         return "ERROR: missing required 'path' argument"
@@ -82,7 +82,7 @@ def _execute_read(args: dict, workspace: Path) -> str:
 
 
 def _execute_write(args: dict, workspace: Path) -> str:
-    """写文件（覆盖）。args: {path: str, content: str}"""
+    """Write a file (overwrites). args: {path: str, content: str}"""
     path = args.get("path", "")
     content = args.get("content", "")
     if not path:
@@ -104,7 +104,7 @@ def _execute_write(args: dict, workspace: Path) -> str:
 
 
 def _execute_edit(args: dict, workspace: Path) -> str:
-    """精确字符串替换。args: {path: str, old_string: str, new_string: str, replace_all?: bool}"""
+    """Exact string replacement. args: {path: str, old_string: str, new_string: str, replace_all?: bool}"""
     path = args.get("path", "")
     old = args.get("old_string", "")
     new = args.get("new_string", "")
@@ -142,7 +142,7 @@ def _execute_edit(args: dict, workspace: Path) -> str:
 
 
 def _execute_bash(args: dict, workspace: Path) -> str:
-    """跑 shell 命令。args: {command: str, timeout?: int(seconds)}"""
+    """Run a shell command. args: {command: str, timeout?: int(seconds)}"""
     command = args.get("command", "")
     if not command:
         return "ERROR: missing required 'command' argument"
@@ -151,15 +151,15 @@ def _execute_bash(args: dict, workspace: Path) -> str:
     except SandboxViolation as e:
         return f"ERROR: {e}"
 
-    # timeout 限制在 [1, MAX_BASH_TIMEOUT]，避免 DeepSeek 给个超大值卡死
+    # timeout clamped to [1, MAX_BASH_TIMEOUT], prevents DeepSeek from stalling with huge values
     try:
         timeout = int(args.get("timeout", DEFAULT_BASH_TIMEOUT))
     except (TypeError, ValueError):
         timeout = DEFAULT_BASH_TIMEOUT
     timeout = max(1, min(timeout, MAX_BASH_TIMEOUT))
 
-    # text=False + 手动 utf-8 解码：跨平台稳定（Windows cmd 输出 GBK 时用
-    # replace fallback 保留可读性，而不是抛 UnicodeDecodeError 让命令"失败"）
+    # text=False + manual utf-8 decode: cross-platform stability (Windows cmd may output GBK;
+    # replace fallback preserves readability instead of throwing UnicodeDecodeError and "failing" the command)
     try:
         result = subprocess.run(
             command,
@@ -183,7 +183,7 @@ def _execute_bash(args: dict, workspace: Path) -> str:
 
 
 def _safe_match(path_str: str, workspace: Path, ws_resolved: Path) -> Path | None:
-    """检查 glob 返回的路径是否仍在 workspace 内（防 symlink 逃逸）。"""
+    """Check that a glob-returned path is still inside the workspace (prevents symlink escape)."""
     try:
         p = Path(path_str).resolve()
         p.relative_to(ws_resolved)
@@ -193,7 +193,7 @@ def _safe_match(path_str: str, workspace: Path, ws_resolved: Path) -> Path | Non
 
 
 def _execute_glob(args: dict, workspace: Path) -> str:
-    """文件名 pattern 匹配。args: {pattern: str, path?: str}"""
+    """File name pattern matching. args: {pattern: str, path?: str}"""
     pattern = args.get("pattern", "")
     if not pattern:
         return "ERROR: missing required 'pattern' argument"
@@ -206,7 +206,7 @@ def _execute_glob(args: dict, workspace: Path) -> str:
     ws_resolved = workspace.resolve()
     raw_matches = sorted(_glob.glob(str(base_path / pattern), recursive=True))
 
-    # 过滤掉 symlink 跳出沙箱的项
+    # Filter out symlinks that escape the sandbox
     safe_matches: list[Path] = []
     rejected = 0
     for m in raw_matches:
@@ -232,19 +232,19 @@ def _execute_glob(args: dict, workspace: Path) -> str:
 
 
 def _execute_notebook_edit(args: dict, workspace: Path) -> str:
-    """编辑 Jupyter notebook (.ipynb) 的单个 cell。
+    """Edit a single cell in a Jupyter notebook (.ipynb).
 
-    比 Read+Write 整个 ipynb 强得多 —— DS 只传"要改什么"，server 端
-    parse JSON、定位 cell、保留 cell_id / metadata / 其他 cells 的
-    outputs，不会因 DS 写错 JSON 把 notebook 弄坏。
+    Much better than Read+Write of the entire ipynb — DS only sends "what to change",
+    the server parses JSON, locates the cell, preserves cell_id / metadata / other cells'
+    outputs, and won't corrupt the notebook if DS writes bad JSON.
 
     args:
-        path: .ipynb 路径
-        edit_mode: "replace" | "insert" | "delete" (默认 replace)
-        cell_id: cell 标识（优先于 cell_index，跨编辑稳定）
-        cell_index: 0-indexed 位置（cell_id 没给时用）
-        new_source: 新源码（replace / insert 用）
-        cell_type: "code" | "markdown" (默认 code，只 insert 用)
+        path: .ipynb file path
+        edit_mode: "replace" | "insert" | "delete" (default replace)
+        cell_id: cell identifier (preferred over cell_index, stable across edits)
+        cell_index: 0-indexed position (used if cell_id not given)
+        new_source: new source code (for replace / insert)
+        cell_type: "code" | "markdown" (default code, only for insert)
     """
     path = args.get("path", "")
     if not path:
@@ -261,7 +261,7 @@ def _execute_notebook_edit(args: dict, workspace: Path) -> str:
     except SandboxViolation as e:
         return f"ERROR: {e}"
 
-    # 读 notebook（或为 insert 创建骨架）
+    # Read notebook (or create skeleton for insert)
     if abs_path.exists():
         try:
             nb = json.loads(abs_path.read_text(encoding="utf-8"))
@@ -272,7 +272,7 @@ def _execute_notebook_edit(args: dict, workspace: Path) -> str:
         if not isinstance(nb, dict) or not isinstance(nb.get("cells"), list):
             return "ERROR: not a valid notebook (missing 'cells' array)"
     elif edit_mode == "insert":
-        # 允许 insert 到不存在的 notebook（自动创建 nbformat 4.5 骨架）
+        # Allow insert into a non-existent notebook (auto-create nbformat 4.5 skeleton)
         nb = {
             "cells": [],
             "metadata": {
@@ -287,7 +287,7 @@ def _execute_notebook_edit(args: dict, workspace: Path) -> str:
 
     cells = nb["cells"]
 
-    # 定位目标 cell
+    # Locate target cell
     cell_id = args.get("cell_id")
     cell_index = args.get("cell_index")
     target_index = None
@@ -311,13 +311,13 @@ def _execute_notebook_edit(args: dict, workspace: Path) -> str:
     elif edit_mode != "insert":
         return "ERROR: replace/delete require cell_id or cell_index"
 
-    # 执行编辑
+    # Execute edit
     new_source = args.get("new_source", "")
     if not isinstance(new_source, str):
         return "ERROR: 'new_source' must be a string"
 
     def _split_source(s: str) -> list[str]:
-        # nbformat 期望 source 是 list[str]，每项末尾保留换行（除最后一行）
+        # nbformat expects source as list[str], preserving newlines at end of each item (except last line)
         if not s:
             return [""]
         lines = s.splitlines(keepends=True)
@@ -327,7 +327,7 @@ def _execute_notebook_edit(args: dict, workspace: Path) -> str:
         cell = cells[target_index]
         cell["source"] = _split_source(new_source)
         if cell.get("cell_type") == "code":
-            # 改了源码，原 outputs 不再代表此 source 的输出 —— 清掉
+            # Source changed; old outputs no longer represent this source — clear them
             cell["outputs"] = []
             cell["execution_count"] = None
         result_msg = f"OK: replaced cell at index {target_index} (id={cell.get('id', 'n/a')})"
@@ -344,7 +344,7 @@ def _execute_notebook_edit(args: dict, workspace: Path) -> str:
         if cell_type == "code":
             new_cell["outputs"] = []
             new_cell["execution_count"] = None
-        # 在 target_index 之后插入（没指定就追加到末尾）
+        # Insert after target_index (or append to end if not specified)
         insert_at = (target_index + 1) if target_index is not None else len(cells)
         cells.insert(insert_at, new_cell)
         result_msg = f"OK: inserted {cell_type} cell at index {insert_at} (id={new_cell['id']})"
@@ -352,7 +352,7 @@ def _execute_notebook_edit(args: dict, workspace: Path) -> str:
         removed = cells.pop(target_index)
         result_msg = f"OK: deleted cell at index {target_index} (was id={removed.get('id', 'n/a')})"
 
-    # 写回
+    # Write back
     try:
         abs_path.parent.mkdir(parents=True, exist_ok=True)
         abs_path.write_text(
@@ -366,7 +366,7 @@ def _execute_notebook_edit(args: dict, workspace: Path) -> str:
 
 
 def _execute_grep(args: dict, workspace: Path) -> str:
-    """正则搜索文件内容。args: {pattern: str, path?: str, glob?: str, max_matches?: int}"""
+    """Regex search file contents. args: {pattern: str, path?: str, glob?: str, max_matches?: int}"""
     pattern = args.get("pattern", "")
     if not pattern:
         return "ERROR: missing required 'pattern' argument"
@@ -389,7 +389,7 @@ def _execute_grep(args: dict, workspace: Path) -> str:
     ws_resolved = workspace.resolve()
     results = []
     for filepath in _glob.iglob(str(base_path / file_glob), recursive=True):
-        # 关键：每个匹配项做沙箱再验证（防 symlink 逃逸读取 /etc/* 等）
+        # Critical: re-validate each match in sandbox (prevents symlink escape reading /etc/* etc.)
         p = _safe_match(filepath, workspace, ws_resolved)
         if p is None or not p.is_file():
             continue
@@ -420,7 +420,7 @@ def _execute_grep(args: dict, workspace: Path) -> str:
     return header + ":\n" + "\n".join(results)
 
 
-# ===== 工具调度表 =====
+# ===== Tool dispatch table =====
 
 TOOL_REGISTRY = {
     "Read": _execute_read,
@@ -434,7 +434,7 @@ TOOL_REGISTRY = {
 
 
 def execute_tool(name: str, args: dict, workspace: Path) -> str:
-    """调度入口：根据工具名调对应实现。"""
+    """Dispatch entry: calls the corresponding implementation by tool name."""
     fn = TOOL_REGISTRY.get(name)
     if fn is None:
         return f"ERROR: unknown tool '{name}'. Available: {list(TOOL_REGISTRY.keys())}"
@@ -445,7 +445,7 @@ def execute_tool(name: str, args: dict, workspace: Path) -> str:
 
 
 def build_tool_schemas(allowed: list[str]) -> list[dict]:
-    """生成 DeepSeek (OpenAI 兼容) 的 tools 参数。"""
+    """Generate the tools parameter for DeepSeek (OpenAI-compatible)."""
     all_schemas = {
         "Read": {
             "name": "Read",

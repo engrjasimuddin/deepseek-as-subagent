@@ -1,47 +1,53 @@
-"""MCP server 入口。
+"""MCP server entry point.
 
-暴露两个工具给 Claude Code:
-  - ping: 健康检查
-  - delegate_to_deepseek: 真正的 sub-agent，把任务外包给 DeepSeek 跑完整 agent loop
+Exposes two tools to Claude Code:
+  - ping: health check
+  - delegate_to_deepseek: true sub-agent, outsources tasks to DeepSeek running a full agent loop
 
-环境变量:
-  - DEEPSEEK_MODE=off: delegate 工具会立即返回 disabled 提示，Claude 不会再调
-  - DEEPSEEK_API_KEY: 覆盖配置文件中的 api_key
-  - DEEPSEEK_WORKSPACE: 覆盖配置文件中的 workspace
+Environment variables:
+  - DEEPSEEK_MODE=off: delegate tool returns disabled notice immediately, Claude won't call again
+  - DEEPSEEK_API_KEY: overrides api_key in config file
+  - DEEPSEEK_WORKSPACE: overrides workspace in config file
 """
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
-# Windows 上 asyncio 默认用 ProactorEventLoop，跟 stdio 子进程不兼容会卡死
-# 必须在 import FastMCP / 启动事件循环之前切到 SelectorEventLoopPolicy
+# On Windows, asyncio defaults to ProactorEventLoop, which is incompatible with stdio subprocesses and hangs.
+# Must switch to SelectorEventLoopPolicy before importing FastMCP / starting the event loop.
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from mcp.server.fastmcp import FastMCP
 
 from . import __version__
-from .agent_loop import AgentLoopError, run_agent
+from .agent_loop import AUDIT_ALLOWED_TOOLS, AUDIT_SYSTEM_PROMPT_TEMPLATE, AgentLoopError, run_agent
 from .config import Config
 
-# 日志写到 ~/.deepseek-mcp/（不污染 stdout，stdout 是 MCP 协议通道）
-# log 目录 700、文件 600 —— 含路径 / task 摘要，多用户机器上不该世界可读
+MAX_AUDIT_FINDINGS = 30
+_SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+# Log to ~/.deepseek-mcp/ (don't pollute stdout, stdout is the MCP protocol channel)
+# log dir 700, file 600 — contains paths / task summaries, shouldn't be world-readable on multi-user machines
 _LOG_DIR = Path.home() / ".deepseek-mcp"
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
 _SERVER_LOG = _LOG_DIR / "server.log"
 _USAGE_LOG = _LOG_DIR / "usage.log"
 
-# Windows 不支持 POSIX 权限位，os.chmod 是 no-op；失败不致命
+# Windows doesn't support POSIX permission bits, os.chmod is a no-op; failure is non-fatal
 try:
     os.chmod(_LOG_DIR, 0o700)
 except OSError:
     pass
 
-# 创建文件后立即 chmod（basicConfig 用 default umask 创建，可能是 644）
+# chmod immediately after creating files (basicConfig creates with default umask, may be 644)
 for _p in (_SERVER_LOG, _USAGE_LOG):
     if not _p.exists():
         try:
@@ -82,7 +88,7 @@ def ping() -> str:
 
 
 def _shorten_path(p: Path) -> str:
-    """长路径压成 ~ + 最后几段，避免 ping 输出爆屏。"""
+    """Compress long paths to ~ + last few segments, avoiding ping output overflow."""
     s = str(p)
     home = str(Path.home())
     if s.startswith(home):
@@ -95,58 +101,96 @@ def _shorten_path(p: Path) -> str:
 
 
 @mcp.tool()
-def delegate_to_deepseek(task: str, context: str = "") -> str:
+def delegate_to_deepseek(task: str, context: str = "", mode: str = "execute") -> str:
     """Delegate a focused task to DeepSeek as a real sub-agent.
 
-    DeepSeek runs its own agent loop with Read/Write/Edit/Bash/Glob/Grep/NotebookEdit tools
-    inside the configured workspace. Use this for batch / repetitive / mechanical
-    tasks where you want to save main-conversation tokens and let DeepSeek do the
-    heavy lifting end-to-end.
+    Two modes:
 
-    Good fits:
-      - Extract i18n keys from N files into JSON
-      - Translate large chunks of text
-      - Scan logs for patterns
-      - Bulk refactors with a clear pattern
-      - One-off ETL scripts
+    mode="execute" (default) — DeepSeek runs its own agent loop with
+    Read/Write/Edit/Bash/Glob/Grep/NotebookEdit tools inside the configured
+    workspace and does the ENTIRE task end-to-end (including any file changes),
+    returning only a final summary. Use this for batch / repetitive / mechanical
+    tasks where you want DeepSeek to do the heavy lifting and hand you back a
+    finished result.
 
-    Bad fits (do it yourself instead):
-      - Architectural design / cross-file judgment
-      - Bug root-cause analysis
-      - Tasks requiring project-specific idioms from CLAUDE.md or other repo conventions
+      Good fits: extract i18n keys from N files into JSON, translate large
+      chunks of text, scan logs for patterns, bulk refactors with a clear
+      pattern, one-off ETL scripts.
+
+    mode="audit" — DeepSeek is READ-ONLY (Read/Glob/Grep only — no Write, Edit,
+    NotebookEdit, or Bash; enforced at the tool-dispatch level, not just by
+    instruction). It investigates and returns structured JSON findings
+    (file/line/summary/severity/confidence) instead of making changes. Use this
+    for read-heavy analysis across many files where finding the issue is
+    expensive but fixing it is cheap — YOU (Claude) then decide what to do
+    with each finding and make the actual edits yourself. Findings are capped
+    at 30, most-severe-first.
+
+      Good fits: "scan these 15 plugins for X pattern", "find every place Y is
+      called without Z", multi-file security/consistency sweeps.
+      Bad fits for audit mode: single-file bug hunts (just Read it yourself),
+      tasks where you already know which 1-2 files to check.
+
+    Neither mode is a fit for: architectural design / cross-file judgment calls,
+    deep single-bug root-cause reasoning, or tasks requiring project-specific
+    idioms from CLAUDE.md (DeepSeek can't see your CLAUDE.md or conversation
+    history — put anything it needs to know into `context`).
 
     Args:
         task: Clear description of what DeepSeek should accomplish, including
-              success criteria and file paths involved.
+              success criteria (execute mode) or what to look for (audit mode),
+              and file paths/scope involved.
         context: Optional additional context — project conventions, related
                  files DeepSeek should consider, output format requirements.
                  Include this when project-specific knowledge matters.
+        mode: "execute" (default) or "audit". Invalid values fall back to
+              "execute" with a warning in the response.
 
     Returns:
-        A summary of what DeepSeek did, including files affected, turns used,
-        tokens consumed, and any issues. Always verify the result by reading
-        a sample of the affected files before declaring success to the user.
+        execute mode: a summary of what DeepSeek did, including files affected,
+        turns used, tokens consumed, and any issues. Always verify by reading a
+        sample of the affected files before declaring success to the user.
+
+        audit mode: a JSON string with "summary", "files_examined", and a
+        "findings" array. Each finding has a "confidence" of "confirmed" or
+        "plausible" — spot-check at least the "plausible" ones yourself before
+        acting on them (DeepSeek's self-reported confidence is a hint, not a
+        guarantee).
     """
-    mode = os.getenv("DEEPSEEK_MODE", "auto")
-    if mode == "off":
+    env_mode = os.getenv("DEEPSEEK_MODE", "auto")
+    if env_mode == "off":
         return (
             "DeepSeek delegation is disabled (DEEPSEEK_MODE=off). "
             "Continue the task yourself in the main conversation."
         )
+
+    mode_warning = ""
+    if mode not in ("execute", "audit"):
+        mode_warning = f"[deepseek-mcp] WARNING: unknown mode '{mode}', falling back to 'execute'.\n\n"
+        mode = "execute"
 
     try:
         config = Config.load()
     except Exception as e:
         return f"ERROR: deepseek-mcp not configured: {e}"
 
+    if mode == "audit":
+        config = dataclasses.replace(config, allowed_tools=list(AUDIT_ALLOWED_TOOLS))
+        system_prompt_template = AUDIT_SYSTEM_PROMPT_TEMPLATE
+    else:
+        system_prompt_template = None
+
     full_task = task
     if context:
         full_task = f"{task}\n\n# Additional context\n{context}"
 
-    logger.info("delegate_to_deepseek invoked. Task length=%d, context length=%d", len(task), len(context))
+    logger.info(
+        "delegate_to_deepseek invoked. mode=%s Task length=%d, context length=%d",
+        mode, len(task), len(context),
+    )
 
     try:
-        result = run_agent(full_task, config)
+        result = run_agent(full_task, config, system_prompt_template=system_prompt_template)
     except AgentLoopError as e:
         logger.exception("Agent loop failed")
         return f"ERROR: DeepSeek agent loop failed: {e}"
@@ -155,17 +199,18 @@ def delegate_to_deepseek(task: str, context: str = "") -> str:
         return f"ERROR: unexpected failure: {e}"
 
     logger.info(
-        "delegate_to_deepseek done. turns=%d tool_calls=%d tokens=%d duration=%.2fs",
+        "delegate_to_deepseek done. mode=%s turns=%d tool_calls=%d tokens=%d duration=%.2fs",
+        mode,
         result["turns_used"],
         result["tool_calls"],
         result["tokens"]["total"],
         result["duration_seconds"],
     )
 
-    # 用量记录（人类可读追加到 usage.log）
-    # 注意：只记 task 前 60 字符摘要，不记 context（context 可能含项目敏感细节）
+    # Usage log (human-readable append to usage.log)
+    # Note: only log first 60 chars of task as summary, don't log context (may contain project-sensitive details)
     try:
-        # 简单大小控制：>10MB 时轮转一次（rename 为 .1）
+        # Simple size control: rotate when >10MB (rename to .1)
         if _USAGE_LOG.exists() and _USAGE_LOG.stat().st_size > 10 * 1024 * 1024:
             try:
                 _USAGE_LOG.replace(_USAGE_LOG.with_suffix(".log.1"))
@@ -174,6 +219,7 @@ def delegate_to_deepseek(task: str, context: str = "") -> str:
         with open(_USAGE_LOG, "a", encoding="utf-8") as f:
             f.write(
                 f"{result['duration_seconds']:.1f}s  "
+                f"mode={mode:<7}  "
                 f"turns={result['turns_used']:>2}  "
                 f"tools={result['tool_calls']:>2}  "
                 f"tokens={result['tokens']['total']:>6}  "
@@ -184,20 +230,104 @@ def delegate_to_deepseek(task: str, context: str = "") -> str:
         except OSError:
             pass
     except Exception:
-        pass  # 日志失败不影响主流程
+        pass  # Log failure doesn't affect main flow
+
+    final_message = result["final_message"]
+    if mode == "audit":
+        final_message = _cap_audit_findings(final_message)
 
     return (
-        f"{result['final_message']}\n\n"
+        f"{mode_warning}"
+        f"{final_message}\n\n"
         f"---\n"
-        f"[deepseek-mcp] {result['turns_used']} turns, "
+        f"[deepseek-mcp] mode={mode}, {result['turns_used']} turns, "
         f"{result['tool_calls']} tool calls, "
         f"{result['tokens']['total']} tokens, "
         f"{result['duration_seconds']}s"
     )
 
 
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)\n```", re.DOTALL)
+
+
+def _try_extract_json_object(raw: str) -> dict | None:
+    """Best-effort JSON extraction from a model response.
+
+    Tried in order:
+      1. The whole trimmed string parses as JSON directly.
+      2. A ```json fenced block ANYWHERE in the text (not just at the start —
+         DeepSeek sometimes writes a sentence like "Let me compile the
+         findings." before the fence, despite being told not to).
+      3. The substring from the first '{' to the last '}' in the text.
+    Returns the parsed dict, or None if nothing works.
+    """
+    text = raw.strip()
+
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        pass
+
+    fence_match = _JSON_FENCE_RE.search(text)
+    if fence_match:
+        try:
+            data = json.loads(fence_match.group(1).strip())
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+
+    first = text.find("{")
+    last = text.rfind("}")
+    if first != -1 and last != -1 and last > first:
+        try:
+            data = json.loads(text[first : last + 1])
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
+def _cap_audit_findings(raw: str) -> str:
+    """Server-side enforcement of the findings cap — don't just trust the prompt.
+
+    DeepSeek is asked to self-limit to 30 findings, sorted most-severe-first,
+    but a prompt instruction isn't a guarantee. If the response parses as the
+    expected JSON shape, re-sort by severity and hard-truncate here too. If it
+    doesn't parse (DeepSeek didn't follow the JSON format), return it unchanged
+    with a note — Claude should treat unparseable audit output as needing extra
+    scrutiny, not silently trust it.
+    """
+    data = _try_extract_json_object(raw)
+    if data is None:
+        return raw + "\n\n[deepseek-mcp] NOTE: audit output was not valid JSON — treat as unverified prose, not structured findings."
+
+    if not isinstance(data, dict) or "findings" not in data:
+        return raw + "\n\n[deepseek-mcp] NOTE: audit output was valid JSON but missing 'findings' — treat as unverified."
+
+    findings = data.get("findings")
+    if not isinstance(findings, list):
+        return raw
+
+    findings_sorted = sorted(
+        findings,
+        key=lambda f: _SEVERITY_RANK.get((f.get("severity") or "").lower(), 99) if isinstance(f, dict) else 99,
+    )
+    if len(findings_sorted) > MAX_AUDIT_FINDINGS:
+        data["findings_truncated"] = True
+        data["findings_total_before_truncation"] = len(findings_sorted)
+        findings_sorted = findings_sorted[:MAX_AUDIT_FINDINGS]
+    data["findings"] = findings_sorted
+
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+
 def main() -> None:
-    """CLI entrypoint."""
+    """CLI entry point."""
     logger.info("deepseek-mcp v%s starting (mode=%s)", __version__, os.getenv("DEEPSEEK_MODE", "auto"))
     try:
         mcp.run()

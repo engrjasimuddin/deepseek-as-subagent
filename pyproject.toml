@@ -1,6 +1,6 @@
 [project]
 name = "deepseek-as-subagent"
-version = "0.0.1"
+version = "0.1.0"
 description = "MCP server that runs DeepSeek as a real sub-agent for Claude Code / Codex CLI — DeepSeek gets its own Read/Edit/Bash agent loop, not just a Q&A endpoint."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -22,7 +22,7 @@ classifiers = [
     "Topic :: Utilities",
 ]
 dependencies = [
-    "mcp[cli]>=1.0.0",
+    "mcp[cli]>=1.0.0,<2.0.0",  # mcp 2.0.0 renamed/moved FastMCP (mcp.server.fastmcp -> mcp.server.mcpserver.MCPServer); pin until this code is ported
     "openai>=1.40.0",
     "httpx[socks]>=0.27.0",  # 兼容 SOCKS 代理（科学上网环境常见）
 ]

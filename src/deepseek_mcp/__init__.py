@@ -1,3 +1,3 @@
-"""deepseek-mcp — Claude Code 的 DeepSeek 苦力 sub-agent。"""
+"""deepseek-mcp — DeepSeek worker sub-agent for Claude Code."""
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"
