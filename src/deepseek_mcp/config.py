@@ -15,7 +15,7 @@ from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".deepseek-mcp" / "config.json"
 
-DEFAULT_MODEL = "deepseek-v4-pro"  # Primary model (strong reasoning); switch to deepseek-v4-flash for cost savings
+DEFAULT_MODEL = "deepseek-flash"  # Primary model (cost-efficient); switch to deepseek-v4-pro for stronger reasoning
 DEFAULT_MAX_TURNS = 50
 DEFAULT_ALLOWED_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "NotebookEdit"]
 
